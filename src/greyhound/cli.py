@@ -181,6 +181,52 @@ def predict(model_dir: str, data_file: str, min_edge: float):
         console.print(vtable)
 
 
+@cli.command("fetch-bsp")
+@click.option("--start", required=True, type=str, help="Start date (YYYY-MM-DD).")
+@click.option("--end", required=True, type=str, help="End date (YYYY-MM-DD).")
+@click.option("--market", type=click.Choice(["win", "place"]), default="win",
+              help="Market type to download.")
+@click.option("--output-dir", type=str, default="data/raw/betfair_bsp",
+              help="Output directory for BSP files.")
+@click.option("--save-parquet/--no-parquet", default=True,
+              help="Save combined parquet after download.")
+def fetch_bsp(start: str, end: str, market: str, output_dir: str, save_parquet: bool):
+    """Download Betfair BSP historical data for greyhounds."""
+    from .data.scraper import BetfairBSPLoader
+
+    start_date = datetime.strptime(start, "%Y-%m-%d").date()
+    end_date = datetime.strptime(end, "%Y-%m-%d").date()
+    total_days = (end_date - start_date).days + 1
+
+    console.print(f"Downloading Betfair BSP ({market}) data: {start_date} to {end_date} ({total_days} days)")
+
+    loader = BetfairBSPLoader(output_dir=output_dir)
+    files = loader.download_range(start_date, end_date, market=market)
+
+    console.print(f"[green]Downloaded {len(files)} files to {output_dir}[/green]")
+
+    if save_parquet and files:
+        df = loader.load_all()
+        if not df.empty:
+            filename = f"bsp_{market}_{start}_{end}.parquet"
+            path = loader.save_parquet(df, filename)
+            console.print(f"[green]Saved {len(df):,} records to {path}[/green]")
+
+            # Show summary
+            console.print(f"\n[bold]BSP Data Summary[/bold]")
+            console.print(f"  Records:     {len(df):,}")
+            console.print(f"  Date range:  {df['date'].min()} to {df['date'].max()}")
+            if "track" in df.columns:
+                console.print(f"  Tracks:      {df['track'].nunique()}")
+            if "greyhound" in df.columns:
+                console.print(f"  Greyhounds:  {df['greyhound'].nunique():,}")
+            if "bsp_win" in df.columns:
+                winners = (df["bsp_win"] == 1).sum()
+                console.print(f"  Winners:     {winners:,} ({winners / len(df):.1%})")
+        else:
+            console.print("[yellow]No valid BSP data found in downloaded files.[/yellow]")
+
+
 @cli.command()
 @click.option("--data-dir", type=str, default="data", help="Data directory.")
 def stats(data_dir: str):

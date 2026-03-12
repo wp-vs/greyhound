@@ -542,6 +542,220 @@ class GreyhoundScraper:
         return path
 
 
+class BetfairBSPLoader:
+    """Download and parse Betfair BSP (Starting Price) CSV files.
+
+    Betfair publishes free daily CSVs at promo.betfair.com with BSP odds
+    and win/lose outcomes for every greyhound runner. This provides
+    historical data going back to ~2018.
+
+    CSV columns: EVENT_DT, EVENT_ID, MENU_HINT, EVENT_NAME,
+                 SELECTION_NAME, WIN_LOSE, BSP, PPWAP, PPMAX, PPMIN,
+                 IPMAX, IPMIN, PPTRADEDVOL, IPTRADEDVOL
+    """
+
+    BASE_URL = "https://promo.betfair.com/betfairsp/prices"
+    WIN_PATTERN = "dwbfgreyhoundwin{date}.csv"
+    PLACE_PATTERN = "dwbfgreyhoundplace{date}.csv"
+
+    def __init__(
+        self,
+        output_dir: str = "data/raw/betfair_bsp",
+        session: Optional[requests.Session] = None,
+    ):
+        self.output_dir = Path(output_dir)
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.session = session or self._create_session()
+        self._last_request_time = 0.0
+
+    @staticmethod
+    def _create_session() -> requests.Session:
+        session = requests.Session()
+        session.headers.update({
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/120.0.0.0 Safari/537.36"
+            ),
+        })
+        return session
+
+    def _rate_limited_get(self, url: str) -> Optional[requests.Response]:
+        """GET with rate limiting and retries. Returns None on 404."""
+        elapsed = time_module.time() - self._last_request_time
+        if elapsed < 1.0:
+            time_module.sleep(1.0 - elapsed)
+
+        for attempt in range(4):
+            try:
+                resp = self.session.get(url, timeout=30)
+                self._last_request_time = time_module.time()
+                if resp.status_code == 404:
+                    return None
+                resp.raise_for_status()
+                return resp
+            except requests.RequestException as e:
+                wait = 2 ** (attempt + 1)
+                if attempt == 3:
+                    logger.error(f"Failed after 4 attempts: {url} — {e}")
+                    return None
+                logger.warning(f"Request failed (attempt {attempt + 1}): {e} — retrying in {wait}s")
+                time_module.sleep(wait)
+        return None
+
+    def download_range(
+        self,
+        start_date: date,
+        end_date: date,
+        market: str = "win",
+        skip_existing: bool = True,
+    ) -> list[Path]:
+        """Download daily BSP CSVs for a date range.
+
+        Args:
+            start_date: First date (inclusive).
+            end_date: Last date (inclusive).
+            market: 'win' or 'place'.
+            skip_existing: Skip files already downloaded.
+
+        Returns:
+            List of paths to downloaded CSV files.
+        """
+        pattern = self.WIN_PATTERN if market == "win" else self.PLACE_PATTERN
+        downloaded = []
+        current = start_date
+        total_days = (end_date - start_date).days + 1
+
+        while current <= end_date:
+            day_num = (current - start_date).days + 1
+            date_str = current.strftime("%d%m%Y")
+            filename = pattern.format(date=date_str)
+            local_path = self.output_dir / filename
+
+            if skip_existing and local_path.exists() and local_path.stat().st_size > 0:
+                logger.debug(f"  Skipping {filename} (already exists)")
+                downloaded.append(local_path)
+                current += timedelta(days=1)
+                continue
+
+            url = f"{self.BASE_URL}/{filename}"
+            logger.info(f"  [{day_num}/{total_days}] Downloading {filename}...")
+            resp = self._rate_limited_get(url)
+
+            if resp is not None and resp.text.strip():
+                local_path.write_text(resp.text, encoding="utf-8")
+                downloaded.append(local_path)
+                logger.info(f"    Saved ({len(resp.text):,} bytes)")
+            else:
+                logger.warning(f"    No data for {current} (no racing or file missing)")
+
+            current += timedelta(days=1)
+
+        logger.info(f"Downloaded {len(downloaded)} files to {self.output_dir}")
+        return downloaded
+
+    def parse_csv(self, filepath: Path) -> pd.DataFrame:
+        """Parse a single Betfair BSP CSV into a standardised DataFrame."""
+        try:
+            df = pd.read_csv(filepath, encoding="utf-8")
+        except Exception as e:
+            logger.warning(f"Failed to parse {filepath}: {e}")
+            return pd.DataFrame()
+
+        if df.empty:
+            return df
+
+        # Standardise column names (strip whitespace)
+        df.columns = df.columns.str.strip()
+
+        # Filter out rows with no BSP
+        if "BSP" in df.columns:
+            df = df[pd.to_numeric(df["BSP"], errors="coerce").notna()].copy()
+            df["BSP"] = pd.to_numeric(df["BSP"], errors="coerce")
+
+        if df.empty:
+            return df
+
+        # Parse date
+        if "EVENT_DT" in df.columns:
+            df["date"] = pd.to_datetime(df["EVENT_DT"], dayfirst=True, errors="coerce").dt.date
+
+        # Parse track from MENU_HINT (e.g. "Greyhounds - Romford" → "Romford")
+        if "MENU_HINT" in df.columns:
+            df["track"] = (
+                df["MENU_HINT"]
+                .astype(str)
+                .str.replace(r"(?i)^.*?-\s*", "", regex=True)
+                .str.strip()
+            )
+
+        # Parse SELECTION_NAME: "1. Dog Name" → trap=1, greyhound="Dog Name"
+        if "SELECTION_NAME" in df.columns:
+            sel = df["SELECTION_NAME"].astype(str)
+            trap_match = sel.str.extract(r"^(\d+)\.\s*(.*)", expand=True)
+            df["trap"] = pd.to_numeric(trap_match[0], errors="coerce").fillna(0).astype(int)
+            df["greyhound"] = trap_match[1].str.strip().fillna(sel.str.strip())
+
+        # Parse EVENT_NAME for race number and distance
+        if "EVENT_NAME" in df.columns:
+            event = df["EVENT_NAME"].astype(str)
+            # Try to extract race number (e.g., "R1", "Race 1")
+            race_num = event.str.extract(r"(?:R|Race\s*)(\d+)", expand=False)
+            df["race_number"] = pd.to_numeric(race_num, errors="coerce").fillna(0).astype(int)
+            # Try to extract distance in metres
+            dist = event.str.extract(r"(\d{3,4})m", expand=False)
+            df["distance"] = pd.to_numeric(dist, errors="coerce").fillna(0).astype(int)
+
+        # Win/lose: 1=win, 0=lose, 2=dead heat
+        if "WIN_LOSE" in df.columns:
+            df["bsp_win"] = df["WIN_LOSE"].astype(str).str.strip()
+            df["bsp_win"] = pd.to_numeric(df["bsp_win"], errors="coerce").fillna(0).astype(int)
+
+        # Rename BSP
+        if "BSP" in df.columns:
+            df["bsp_decimal"] = df["BSP"]
+
+        # Keep betfair event ID
+        if "EVENT_ID" in df.columns:
+            df["betfair_event_id"] = df["EVENT_ID"]
+
+        # Select output columns
+        out_cols = [
+            "date", "track", "race_number", "distance", "trap",
+            "greyhound", "bsp_decimal", "bsp_win", "betfair_event_id",
+        ]
+        out_cols = [c for c in out_cols if c in df.columns]
+        return df[out_cols].reset_index(drop=True)
+
+    def load_all(self) -> pd.DataFrame:
+        """Load and combine all downloaded BSP CSVs."""
+        frames = []
+        csv_files = sorted(self.output_dir.glob("dwbfgreyhound*.csv"))
+        for f in csv_files:
+            df = self.parse_csv(f)
+            if not df.empty:
+                frames.append(df)
+
+        if not frames:
+            return pd.DataFrame()
+
+        combined = pd.concat(frames, ignore_index=True)
+        combined = combined.drop_duplicates(
+            subset=["date", "track", "trap", "greyhound"], keep="last"
+        )
+        combined = combined.sort_values(["date", "track", "race_number", "trap"])
+        combined = combined.reset_index(drop=True)
+        logger.info(f"Loaded {len(combined)} BSP records from {len(csv_files)} files")
+        return combined
+
+    def save_parquet(self, df: pd.DataFrame, filename: str = "bsp_data.parquet") -> Path:
+        """Save combined BSP data to parquet."""
+        path = self.output_dir / filename
+        df.to_parquet(path, index=False)
+        logger.info(f"Saved {len(df)} BSP rows to {path}")
+        return path
+
+
 class SISDataLoader:
     """Load and parse SIS greyhound data feeds.
 
@@ -609,6 +823,15 @@ class HistoricalDataLoader:
                 frames.append(SISDataLoader.load_csv(str(f)))
             except Exception as e:
                 logger.warning(f"Failed to load {f}: {e}")
+
+        # Load BSP data
+        bsp_dir = self.data_dir / "raw" / "betfair_bsp"
+        if bsp_dir.exists():
+            bsp_loader = BetfairBSPLoader(output_dir=str(bsp_dir))
+            bsp_df = bsp_loader.load_all()
+            if not bsp_df.empty:
+                frames.append(bsp_df)
+                logger.info(f"Loaded {len(bsp_df)} BSP records")
 
         if not frames:
             logger.warning("No data files found")
