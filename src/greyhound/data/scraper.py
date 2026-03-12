@@ -1,9 +1,19 @@
 """Historical data scraper for UK greyhound race results.
 
-Extracts race data from publicly available sources including:
-- GBGB (Greyhound Board of Great Britain) results
-- SIS/timeform data where available
-- Historical results archives
+Uses the GBGB (Greyhound Board of Great Britain) JSON API at
+api.gbgb.org.uk to extract race results. The API provides:
+
+1. Paginated results listing: GET /api/results?page=N
+   Returns meeting summaries with meeting IDs.
+
+2. Meeting detail: GET /api/results/meeting/{meetingId}
+   Returns full race details including traps/runners for a meeting.
+
+The approach:
+- Iterate through paginated results to discover meeting IDs
+- Filter by date range and optionally by track
+- Fetch full meeting details for each meeting
+- Parse JSON into Race/RaceResult objects
 
 Usage:
     scraper = GreyhoundScraper(output_dir="data/raw")
@@ -17,29 +27,25 @@ Usage:
 import logging
 import re
 import time as time_module
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Optional
-from urllib.parse import urljoin
+from typing import Any, Optional
 
 import pandas as pd
 import requests
-from bs4 import BeautifulSoup
 
 from .schema import Race, RaceResult, UK_TRACKS
 
 logger = logging.getLogger(__name__)
 
-# Rate limiting
-REQUEST_DELAY = 1.5  # seconds between requests
+# Rate limiting — be respectful to avoid Cloudflare blocks
+REQUEST_DELAY = 2.0  # seconds between requests
 
 
 class GreyhoundScraper:
-    """Scrapes historical UK greyhound race results."""
+    """Scrapes historical UK greyhound race results via the GBGB JSON API."""
 
-    # GBGB results base URL
-    GBGB_BASE = "https://www.gbgb.org.uk"
-    GBGB_RESULTS = f"{GBGB_BASE}/results-archive/"
+    API_BASE = "https://api.gbgb.org.uk/api"
 
     def __init__(self, output_dir: str = "data/raw", session: Optional[requests.Session] = None):
         self.output_dir = Path(output_dir)
@@ -55,8 +61,10 @@ class GreyhoundScraper:
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
                 "Chrome/120.0.0.0 Safari/537.36"
             ),
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept": "application/json, text/plain, */*",
             "Accept-Language": "en-GB,en;q=0.9",
+            "Referer": "https://www.gbgb.org.uk/",
+            "Origin": "https://www.gbgb.org.uk",
         })
         return session
 
@@ -66,17 +74,18 @@ class GreyhoundScraper:
         if elapsed < REQUEST_DELAY:
             time_module.sleep(REQUEST_DELAY - elapsed)
 
-        for attempt in range(3):
+        for attempt in range(4):
             try:
                 resp = self.session.get(url, timeout=30, **kwargs)
                 self._last_request_time = time_module.time()
                 resp.raise_for_status()
                 return resp
             except requests.RequestException as e:
-                if attempt == 2:
+                wait = 2 ** (attempt + 1)
+                if attempt == 3:
                     raise
-                logger.warning(f"Request failed (attempt {attempt + 1}): {e}")
-                time_module.sleep(2 ** (attempt + 1))
+                logger.warning(f"Request failed (attempt {attempt + 1}): {e} — retrying in {wait}s")
+                time_module.sleep(wait)
 
         raise RuntimeError("Unreachable")
 
@@ -86,7 +95,7 @@ class GreyhoundScraper:
         end_date: date,
         tracks: Optional[list[str]] = None,
     ) -> list[Race]:
-        """Scrape race results for a date range.
+        """Scrape race results for a date range via the GBGB API.
 
         Args:
             start_date: First date to scrape (inclusive).
@@ -96,202 +105,399 @@ class GreyhoundScraper:
         Returns:
             List of Race objects with results.
         """
+        # Step 1: Discover meeting IDs by iterating through paginated results
+        meeting_ids = self._discover_meetings(start_date, end_date, tracks)
+        logger.info(f"Found {len(meeting_ids)} meetings to scrape")
+
+        # Step 2: Fetch full details for each meeting
         all_races = []
-        current = start_date
-
-        while current <= end_date:
-            logger.info(f"Scraping results for {current}")
+        for i, (meeting_id, track, meeting_date) in enumerate(meeting_ids):
+            logger.info(
+                f"  [{i + 1}/{len(meeting_ids)}] Fetching meeting {meeting_id} "
+                f"({track}, {meeting_date})"
+            )
             try:
-                day_races = self._scrape_day(current, tracks)
-                all_races.extend(day_races)
-                logger.info(f"  Found {len(day_races)} races")
+                races = self._fetch_meeting(meeting_id, track, meeting_date)
+                all_races.extend(races)
+                logger.info(f"    Got {len(races)} races")
             except Exception as e:
-                logger.error(f"  Failed to scrape {current}: {e}")
+                logger.error(f"    Failed to fetch meeting {meeting_id}: {e}")
 
-            current += timedelta(days=1)
-
+        logger.info(f"Total: {len(all_races)} races scraped")
         return all_races
 
-    def _scrape_day(self, race_date: date, tracks: Optional[list[str]] = None) -> list[Race]:
-        """Scrape all races for a single day from GBGB."""
-        date_str = race_date.strftime("%Y-%m-%d")
-        url = f"{self.GBGB_RESULTS}?searchDate={date_str}"
+    def _discover_meetings(
+        self,
+        start_date: date,
+        end_date: date,
+        tracks: Optional[list[str]] = None,
+    ) -> list[tuple[int, str, date]]:
+        """Discover meeting IDs by paginating through the results API.
 
-        resp = self._rate_limited_get(url)
-        soup = BeautifulSoup(resp.text, "lxml")
+        Returns list of (meeting_id, track_name, date) tuples.
+        """
+        meetings = []
+        page = 1
+        max_pages = 5000  # safety limit
+        seen_ids = set()
+        reached_start = False
 
-        races = []
-        # Find meeting links for the day
-        meeting_links = self._extract_meeting_links(soup, tracks)
+        while page <= max_pages:
+            logger.info(f"Scanning results page {page}...")
+            url = f"{self.API_BASE}/results?page={page}"
 
-        for track_name, meeting_url in meeting_links:
             try:
-                meeting_races = self._scrape_meeting(track_name, meeting_url, race_date)
-                races.extend(meeting_races)
+                resp = self._rate_limited_get(url)
+                data = resp.json()
             except Exception as e:
-                logger.error(f"  Failed to scrape meeting {track_name}: {e}")
+                logger.error(f"Failed to fetch page {page}: {e}")
+                break
 
-        return races
+            # Handle different response formats
+            items = self._extract_items(data)
 
-    def _extract_meeting_links(
-        self, soup: BeautifulSoup, tracks: Optional[list[str]] = None
-    ) -> list[tuple[str, str]]:
-        """Extract meeting links from the results archive page."""
-        links = []
-        for link in soup.select("a[href*='results']"):
-            text = link.get_text(strip=True)
-            href = link.get("href", "")
+            if not items:
+                logger.info(f"No more results at page {page}")
+                break
 
-            # Match track names
-            for track in (tracks or UK_TRACKS):
-                if track.lower() in text.lower():
-                    full_url = urljoin(self.GBGB_BASE, href)
-                    links.append((track, full_url))
+            for item in items:
+                meeting_id = self._get_field(item, ["meetingId", "meeting_id", "id", "Id"])
+                track_name = self._get_field(
+                    item, ["trackName", "track_name", "track", "Track", "venue", "Venue"]
+                )
+                date_str = self._get_field(
+                    item, ["meetingDate", "meeting_date", "date", "Date", "raceDate"]
+                )
+
+                if meeting_id is None or date_str is None:
+                    continue
+
+                meeting_id = int(meeting_id)
+                if meeting_id in seen_ids:
+                    continue
+                seen_ids.add(meeting_id)
+
+                # Parse date
+                meeting_date = self._parse_date(date_str)
+                if meeting_date is None:
+                    continue
+
+                # Check date range
+                if meeting_date > end_date:
+                    continue
+                if meeting_date < start_date:
+                    reached_start = True
+                    continue
+
+                # Filter by track if specified
+                if tracks and track_name:
+                    if not any(t.lower() in track_name.lower() for t in tracks):
+                        continue
+
+                meetings.append((meeting_id, track_name or "Unknown", meeting_date))
+
+            # If we've gone past the start date, stop paginating
+            if reached_start:
+                # Check if ALL items on this page are before start_date
+                page_dates = []
+                for item in items:
+                    ds = self._get_field(
+                        item, ["meetingDate", "meeting_date", "date", "Date", "raceDate"]
+                    )
+                    if ds:
+                        d = self._parse_date(ds)
+                        if d:
+                            page_dates.append(d)
+                if page_dates and all(d < start_date for d in page_dates):
+                    logger.info("All results on page are before start_date, stopping")
                     break
 
-        return links
+            page += 1
 
-    def _scrape_meeting(
-        self, track: str, url: str, race_date: date
+        return sorted(meetings, key=lambda x: x[2])
+
+    def _fetch_meeting(
+        self, meeting_id: int, track: str, meeting_date: date
     ) -> list[Race]:
-        """Scrape all races from a single meeting page."""
-        resp = self._rate_limited_get(url)
-        soup = BeautifulSoup(resp.text, "lxml")
+        """Fetch full race details for a single meeting."""
+        url = f"{self.API_BASE}/results/meeting/{meeting_id}"
+        params = {"meeting": meeting_id}
 
+        resp = self._rate_limited_get(url, params=params)
+        data = resp.json()
+
+        return self._parse_meeting_response(data, meeting_id, track, meeting_date)
+
+    def _parse_meeting_response(
+        self, data: Any, meeting_id: int, track: str, meeting_date: date
+    ) -> list[Race]:
+        """Parse the JSON response from a meeting detail endpoint."""
         races = []
-        race_sections = soup.select(".race-result, .raceResult, [class*='race']")
 
-        for i, section in enumerate(race_sections, 1):
-            try:
-                race = self._parse_race_section(section, track, race_date, i)
+        # The response may be a list or a dict with a races key
+        if isinstance(data, list):
+            # Each item may be a meeting with races
+            for meeting in data:
+                race_list = self._get_field(meeting, ["races", "Races"]) or []
+                for race_data in race_list:
+                    race = self._parse_race(race_data, meeting_id, track, meeting_date)
+                    if race and race.results:
+                        races.append(race)
+        elif isinstance(data, dict):
+            race_list = self._get_field(data, ["races", "Races"]) or []
+            if not race_list:
+                # Maybe the dict itself contains race data at the top level
+                race_list = [data]
+            for race_data in race_list:
+                race = self._parse_race(race_data, meeting_id, track, meeting_date)
                 if race and race.results:
                     races.append(race)
-            except Exception as e:
-                logger.warning(f"  Failed to parse race {i} at {track}: {e}")
 
         return races
 
-    def _parse_race_section(
-        self, section: BeautifulSoup, track: str, race_date: date, race_num: int
+    def _parse_race(
+        self, race_data: dict, meeting_id: int, track: str, meeting_date: date
     ) -> Optional[Race]:
-        """Parse a single race result section."""
-        # Extract race metadata
-        header = section.find(["h2", "h3", "h4", ".race-header", "[class*='header']"])
-        header_text = header.get_text(strip=True) if header else ""
+        """Parse a single race from the API response."""
+        race_id_val = self._get_field(race_data, ["raceId", "race_id", "id", "Id"])
+        race_number = self._get_field(
+            race_data, ["raceNumber", "race_number", "raceNo", "RaceNo"]
+        )
+        distance = self._get_field(
+            race_data, ["distance", "Distance", "raceDistance"]
+        )
+        grade = self._get_field(
+            race_data, ["raceGrade", "grade", "Grade", "raceClass"]
+        )
+        race_type = self._get_field(
+            race_data, ["raceType", "race_type", "type"]
+        )
+        going = self._get_field(
+            race_data, ["going", "Going", "goingDescription"]
+        )
+        winning_time = self._get_field(
+            race_data, ["winningTime", "winning_time", "winTime"]
+        )
+        race_time_str = self._get_field(
+            race_data, ["raceTime", "race_time", "time", "offTime"]
+        )
+        prize = self._get_field(
+            race_data, ["prizeMoney", "prize_money", "firstPrize", "totalPrize"]
+        )
+        forecast = self._get_field(
+            race_data, ["forecast", "Forecast", "forecastDividend"]
+        )
+        tricast = self._get_field(
+            race_data, ["tricast", "Tricast", "tricastDividend"]
+        )
 
-        distance = self._extract_distance(header_text)
-        grade = self._extract_grade(header_text)
-
-        race_id = f"{race_date.isoformat()}_{track}_{race_num}"
+        # Build race ID
+        race_id = f"{meeting_date.isoformat()}_{track}_{race_number or race_id_val or 0}"
 
         race = Race(
             race_id=race_id,
-            date=race_date,
+            date=meeting_date,
             track=track,
-            race_number=race_num,
-            distance=distance or 0,
-            grade=grade,
+            race_number=int(race_number or 0),
+            distance=int(distance or 0),
+            grade=str(grade) if grade else None,
+            race_type=str(race_type) if race_type else None,
+            going=str(going) if going else None,
+            winning_time=float(winning_time) if winning_time else None,
+            prize_money=float(prize) if prize else None,
+            forecast=str(forecast) if forecast else None,
+            tricast=str(tricast) if tricast else None,
         )
 
-        # Extract individual results
-        rows = section.select("tr, .runner, [class*='runner']")
-        for row in rows:
-            result = self._parse_result_row(row)
+        # Parse traps/runners
+        traps = self._get_field(race_data, ["traps", "Traps", "runners", "Runners", "dogs"]) or []
+        for trap_data in traps:
+            result = self._parse_trap(trap_data)
             if result:
                 race.results.append(result)
 
+        # Sort results by position
+        race.results.sort(key=lambda r: r.finish_position if r.finish_position else 99)
+
         return race
 
-    def _parse_result_row(self, row: BeautifulSoup) -> Optional[RaceResult]:
-        """Parse a single runner result row."""
-        cells = row.find_all(["td", "span", "div"])
-        if len(cells) < 3:
+    def _parse_trap(self, trap_data: dict) -> Optional[RaceResult]:
+        """Parse a single trap/runner from the API response."""
+        dog_name = self._get_field(
+            trap_data,
+            ["dogName", "dog_name", "name", "Name", "greyhoundName", "dogname"],
+        )
+        if not dog_name:
             return None
 
-        texts = [c.get_text(strip=True) for c in cells]
-
-        # Try to extract position, trap, name, time, SP
-        position = self._extract_int(texts[0]) if texts else None
-        if position is None or position < 1:
-            return None
-
-        trap = self._extract_int(texts[1]) if len(texts) > 1 else None
-        name = texts[2] if len(texts) > 2 else "Unknown"
-
-        # Clean greyhound name
-        name = re.sub(r"\s*\(.*?\)\s*", "", name).strip()
-        if not name or len(name) < 2:
-            return None
-
-        # Extract finishing time
-        finish_time = None
-        sp_decimal = None
-        for t in texts[3:]:
-            if not finish_time:
-                finish_time = self._extract_time(t)
-            if not sp_decimal:
-                sp_decimal = self._parse_sp(t)
-
-        return RaceResult(
-            greyhound_name=name,
-            trap=trap or 0,
-            finish_position=position,
-            finish_time=finish_time,
-            starting_price_decimal=sp_decimal,
+        trap = self._get_field(
+            trap_data, ["trapNumber", "trap_number", "trap", "Trap", "trapNo"]
+        )
+        position = self._get_field(
+            trap_data,
+            ["resultPosition", "result_position", "position", "Position",
+             "finishPosition", "pos", "finishingPosition"],
+        )
+        finish_time = self._get_field(
+            trap_data,
+            ["resultRunTime", "run_time", "runTime", "time", "Time",
+             "finishTime", "calcTime"],
+        )
+        sectional = self._get_field(
+            trap_data,
+            ["resultSectionalTime", "sectional_time", "sectionalTime",
+             "sectional", "bendTime", "firstSectionalTime"],
+        )
+        sp = self._get_field(
+            trap_data,
+            ["resultStartingPrice", "starting_price", "startingPrice",
+             "sp", "SP", "bsp"],
+        )
+        weight = self._get_field(
+            trap_data, ["dogWeight", "weight", "Weight"]
+        )
+        trainer = self._get_field(
+            trap_data, ["trainerName", "trainer_name", "trainer", "Trainer"]
+        )
+        comment = self._get_field(
+            trap_data,
+            ["resultComment", "comment", "Comment", "runComment"],
+        )
+        btn = self._get_field(
+            trap_data,
+            ["resultBtnDistance", "btn_distance", "btnDistance",
+             "beatenDistance", "btn"],
         )
 
+        # Parse position — handle non-finishers
+        pos_int = self._parse_position(position)
+        if pos_int is None:
+            return None
+
+        # Parse SP to decimal
+        sp_decimal = None
+        if sp is not None:
+            sp_decimal = self._parse_sp(str(sp))
+
+        return RaceResult(
+            greyhound_name=str(dog_name).strip(),
+            trap=int(trap) if trap else 0,
+            finish_position=pos_int,
+            finish_time=float(finish_time) if finish_time else None,
+            sectional_time=float(sectional) if sectional else None,
+            starting_price=str(sp) if sp else None,
+            starting_price_decimal=sp_decimal,
+            weight=float(weight) if weight else None,
+            trainer=str(trainer) if trainer else None,
+            comment=str(comment) if comment else None,
+            btn=float(btn) if btn else None,
+        )
+
+    # --- Helper methods ---
+
     @staticmethod
-    def _extract_distance(text: str) -> Optional[int]:
-        """Extract race distance in metres from text."""
-        match = re.search(r"(\d{3,4})\s*m", text, re.IGNORECASE)
-        if match:
-            return int(match.group(1))
-        # Try yards conversion
-        match = re.search(r"(\d{3,4})\s*y", text, re.IGNORECASE)
-        if match:
-            return int(int(match.group(1)) * 0.9144)
+    def _get_field(data: dict, field_names: list[str]) -> Any:
+        """Try multiple field names and return the first match."""
+        for name in field_names:
+            if name in data:
+                val = data[name]
+                if val is not None and val != "":
+                    return val
         return None
 
     @staticmethod
-    def _extract_grade(text: str) -> Optional[str]:
-        """Extract race grade from text."""
-        match = re.search(r"\b(OR|S|[A-E]\d{1,2}|IT|P|D\d)\b", text)
-        return match.group(1) if match else None
+    def _extract_items(data: Any) -> list[dict]:
+        """Extract the list of items from a paginated API response."""
+        if isinstance(data, list):
+            return data
+
+        if isinstance(data, dict):
+            # Try common pagination wrapper keys
+            for key in ["data", "results", "items", "meetings", "Records",
+                        "records", "Meetings", "Data"]:
+                if key in data and isinstance(data[key], list):
+                    return data[key]
+
+            # Maybe the dict has numeric keys (paginated items)
+            if "1" in data or 1 in data:
+                return list(data.values())
+
+        return []
 
     @staticmethod
-    def _extract_int(text: str) -> Optional[int]:
-        """Extract first integer from text."""
-        match = re.search(r"(\d+)", text)
-        return int(match.group(1)) if match else None
+    def _parse_date(date_str: Any) -> Optional[date]:
+        """Parse various date formats to a date object."""
+        if isinstance(date_str, date):
+            return date_str
+        if not isinstance(date_str, str):
+            return None
 
-    @staticmethod
-    def _extract_time(text: str) -> Optional[float]:
-        """Extract time in seconds from text like '29.45' or '30.12'."""
-        match = re.search(r"(\d{2,3}\.\d{1,2})", text)
+        # Try ISO format first
+        for fmt in [
+            "%Y-%m-%dT%H:%M:%S",
+            "%Y-%m-%dT%H:%M:%S.%f",
+            "%Y-%m-%dT%H:%M:%SZ",
+            "%Y-%m-%d",
+            "%d/%m/%Y",
+            "%d-%m-%Y",
+            "%d %b %Y",
+            "%d %B %Y",
+        ]:
+            try:
+                return datetime.strptime(date_str[:len(fmt) + 5], fmt).date()
+            except (ValueError, IndexError):
+                continue
+
+        # Try parsing just the date part
+        match = re.search(r"(\d{4}-\d{2}-\d{2})", date_str)
         if match:
-            val = float(match.group(1))
-            if 15.0 < val < 120.0:  # reasonable greyhound race time range
-                return val
+            return datetime.strptime(match.group(1), "%Y-%m-%d").date()
+
+        return None
+
+    @staticmethod
+    def _parse_position(pos: Any) -> Optional[int]:
+        """Parse finishing position, handling non-finishers."""
+        if pos is None:
+            return None
+        if isinstance(pos, (int, float)):
+            p = int(pos)
+            return p if p >= 1 else None
+
+        pos_str = str(pos).strip().upper()
+        # Non-finishers
+        if pos_str in ("DNF", "NR", "DNS", "FO", "RO", "BD", ""):
+            return None
+
+        match = re.search(r"(\d+)", pos_str)
+        if match:
+            return int(match.group(1))
         return None
 
     @staticmethod
     def _parse_sp(text: str) -> Optional[float]:
         """Parse starting price to decimal odds."""
+        text = text.strip()
+
+        # Evens
+        if text.lower() in ("evs", "evens", "ev"):
+            return 2.0
+
         # Fractional: "5/2", "3/1", "11/4"
         match = re.search(r"(\d+)/(\d+)", text)
         if match:
             num, den = int(match.group(1)), int(match.group(2))
             if den > 0:
                 return round(num / den + 1, 2)
-        # Decimal: "3.50", "2.10"
-        match = re.search(r"^(\d+\.\d{1,2})$", text.strip())
-        if match:
-            val = float(match.group(1))
-            if 1.01 <= val <= 100.0:
+
+        # Already decimal: "3.50", "2.10"
+        try:
+            val = float(text)
+            if 1.01 <= val <= 200.0:
                 return val
-        # Evens
-        if text.strip().lower() in ("evs", "evens"):
-            return 2.0
+        except ValueError:
+            pass
+
         return None
 
     def to_dataframe(self, races: list[Race]) -> pd.DataFrame:
